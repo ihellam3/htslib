@@ -53,3 +53,5 @@ lib*.so.*
 /test/*.tmp.*
 
 /TAGS
+cscope.files
+tags
