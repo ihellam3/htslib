@@ -851,6 +851,222 @@ int hfile_plugin_init_mem(struct hFILE_plugin *self)
     return 0;
 }
 
+/***************************************
+ * Partial File support, NOT thread safe
+ * *************************************/
+typedef struct {
+    hFILE base;
+    //pthread_mutex_t lock;
+    int fd;
+    int fd_close;
+    off_t off;
+
+    size_t sz;
+    off_t cur;
+} hFILE_partial;
+
+static ssize_t partial_read(hFILE *fpv, void *buffer, size_t nbytes)
+{
+    hFILE_partial *fp = (hFILE_partial *) fpv;
+    ssize_t n;
+    size_t left;
+
+    //pthread_mutex_lock(&fp->lock);
+
+    do {
+        left = fp->sz - (size_t)(fp->cur - fp->off);
+        if(left <= 0) {
+            n = 0;
+            break;
+        } else if(left < nbytes) {
+            n = read(fp->fd, buffer, left);
+        } else {
+            n = read(fp->fd, buffer, nbytes);
+        }
+        if(n > 0) {
+            fp->cur += n;
+        }
+    } while (n < 0 && errno == EINTR);
+
+    //pthread_mutex_unlock(&fp->lock);
+
+    return n;
+}
+
+static ssize_t partial_write(hFILE *fpv, const void *buffer, size_t nbytes)
+{
+    hFILE_partial *fp = (hFILE_partial *) fpv;
+    ssize_t n;
+    size_t sz;
+
+    //pthread_mutex_lock(&fp->lock);
+
+    do {
+        n = write(fp->fd, buffer, nbytes);
+        if(n > 0) {
+            sz = (size_t)(fp->cur - fp->off) + n;
+            if(sz > fp->sz) {
+                fp->sz = sz;
+            }
+            fp->cur += n;
+            //fprintf(stderr, "sz=%d fpsz=%d\n", (int)sz, (int)fp->sz);
+        }
+    } while (n < 0 && errno == EINTR);
+
+    //pthread_mutex_unlock(&fp->lock);
+
+#ifdef _WIN32
+        // On windows we have no SIGPIPE.  Instead write returns
+        // EINVAL.  We check for this and our fd being a pipe.
+        // If so, we raise SIGTERM instead of SIGPIPE.  It's not
+        // ideal, but I think the only alternative is extra checking
+        // in every single piece of code.
+        if (n < 0 && errno == EINVAL &&
+            GetLastError() == ERROR_NO_DATA &&
+            GetFileType((HANDLE)_get_osfhandle(fp->fd)) == FILE_TYPE_PIPE) {
+            raise(SIGTERM);
+        }
+#endif
+    return n;
+}
+
+static off_t partial_seek(hFILE *fpv, off_t offset, int whence)
+{
+    hFILE_partial *fp = (hFILE_partial *) fpv;
+    off_t new_off = -1;
+
+    //pthread_mutex_lock(&fp->lock);
+
+    switch(whence) {
+        case SEEK_SET:
+            if(offset > fp->sz) {
+                new_off = -1;
+            } else {
+                offset += fp->off;
+                new_off = lseek(fp->fd, offset, whence);
+                if(-1 != new_off) {
+                    fp->cur = new_off;
+                    new_off -= fp->off;
+                }
+            }
+            break;
+        case SEEK_CUR:
+            new_off = lseek(fp->fd, offset, whence);
+            if(-1 != new_off) {
+                if(new_off < fp->off || new_off > (fp->off + fp->sz)) {
+                    //offset is error, reset to last offset
+                    lseek(fp->fd, new_off, SEEK_SET);
+                    new_off = -1;
+                } else {
+                    fp->cur = new_off;
+                    new_off -= fp->off;
+                }
+            }
+            break;
+        case SEEK_END:
+            if((0-offset) > fp->sz) {
+                new_off = -1;
+            } else {
+                offset += fp->off + fp->sz;
+                new_off = lseek(fp->fd, offset, SEEK_SET);
+                //fprintf(stderr, "new_off=%d\n", (int)new_off);
+                if(-1 != new_off) {
+                    if(new_off < fp->off || new_off > (fp->off + fp->sz)) {
+                        //offset is error, reset to last offset
+                        lseek(fp->fd, new_off, SEEK_SET);
+                        new_off = -1;
+                    } else {
+                        fp->cur = new_off;
+                        new_off -= fp->off;
+                    }
+                }
+            }
+            break;
+    }
+
+    //pthread_mutex_unlock(&fp->lock);
+
+    return new_off;
+}
+
+static int partial_flush(hFILE *fpv)
+{
+    int ret = 0;
+    do {
+#ifdef HAVE_FDATASYNC
+        hFILE_partial *fp = (hFILE_partial *) fpv;
+        ret = fdatasync(fp->fd);
+#elif defined(HAVE_FSYNC)
+        hFILE_partial *fp = (hFILE_partial *) fpv;
+        ret = fsync(fp->fd);
+#endif
+        // Ignore invalid-for-fsync(2) errors due to being, e.g., a pipe,
+        // and operation-not-supported errors (Mac OS X)
+        if (ret < 0 && (errno == EINVAL || errno == ENOTSUP)) ret = 0;
+    } while (ret < 0 && errno == EINTR);
+    return ret;
+}
+
+static int partial_close(hFILE *fpv)
+{
+    hFILE_partial *fp = (hFILE_partial *) fpv;
+    if(fp->fd_close && fp->fd != -1) {
+        close(fp->fd);
+        fp->fd = -1;
+    }
+    //pthread_mutex_destroy(&fp->lock);
+    return 0;
+}
+
+static const struct hFILE_backend partial_backend =
+{
+    partial_read, partial_write, partial_seek, partial_flush, partial_close
+};
+
+static hFILE *create_hfile_partial(const char *mode, int fd, size_t sz, int fd_close)
+{
+    hFILE_partial *fp = (hFILE_partial *) hfile_init(sizeof(hFILE_partial), mode, blksize(fd));
+    if (fp == NULL) {
+        return NULL;
+    }
+
+    fp->fd = fd;
+    fp->sz = sz;
+    fp->off = lseek(fd, 0, SEEK_CUR);
+    fp->cur = fp->off;
+    fp->fd_close = fd_close;
+    //pthread_mutex_init(&fp->lock, NULL);
+
+    //fprintf(stderr, "partial vopen sz=%d\n", (int)sz);
+
+    fp->base.backend = &partial_backend;
+    return &fp->base;
+}
+
+hFILE *hopenv_partial(const char *filename, const char *mode, va_list args)
+{
+    int fd = va_arg(args, int);
+    size_t sz = va_arg(args, size_t);
+    int fd_close = va_arg(args, int);
+    va_end(args);
+
+    hFILE* hf;
+
+    if(!(hf = create_hfile_partial(mode, fd, sz, fd_close))){
+        return NULL;
+    }
+
+    return hf;
+}
+
+int hfile_plugin_init_partial(struct hFILE_plugin *self)
+{
+    static const struct hFILE_scheme_handler handler =
+            {NULL, hfile_always_local, "partial", 2000 + 10, hopenv_partial};
+    self->name = "partial";
+    hfile_add_scheme_handler("partial", &handler);
+    return 0;
+}
 
 /*****************************************
  * Plugin and hopen() backend dispatcher *
@@ -944,6 +1160,7 @@ static void load_hfile_plugins()
     hfile_add_scheme_handler("preload", &preload);
     init_add_plugin(NULL, hfile_plugin_init_net, "knetfile");
     init_add_plugin(NULL, hfile_plugin_init_mem, "mem");
+    init_add_plugin(NULL, hfile_plugin_init_partial, "partial");
 
 #ifdef ENABLE_PLUGINS
     struct hts_path_itr path;
@@ -1008,6 +1225,7 @@ static const struct hFILE_scheme_handler *find_scheme_handler(const char *s)
     // 1 byte schemes are likely windows C:/foo pathnames
     if (i <= 1 || i >= sizeof scheme) return NULL;
     scheme[i] = '\0';
+    //fprintf(stderr, "scheme=%s\n", scheme);
 
     pthread_mutex_lock(&plugins_lock);
     if (! schemes) load_hfile_plugins();
