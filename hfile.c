@@ -943,7 +943,7 @@ static off_t partial_seek(hFILE *fpv, off_t offset, int whence)
                 new_off = -1;
             } else {
                 offset += fp->off;
-                new_off = lseek(fp->fd, offset, whence);
+                new_off = lseek(fp->fd, offset, SEEK_SET);
                 if(-1 != new_off) {
                     fp->cur = new_off;
                     new_off -= fp->off;
@@ -955,7 +955,7 @@ static off_t partial_seek(hFILE *fpv, off_t offset, int whence)
             if(-1 != new_off) {
                 if(new_off < fp->off || new_off > (fp->off + fp->sz)) {
                     //offset is error, reset to last offset
-                    lseek(fp->fd, new_off, SEEK_SET);
+                    lseek(fp->fd, (off_t)fp->cur, SEEK_SET);
                     new_off = -1;
                 } else {
                     fp->cur = new_off;
@@ -973,7 +973,7 @@ static off_t partial_seek(hFILE *fpv, off_t offset, int whence)
                 if(-1 != new_off) {
                     if(new_off < fp->off || new_off > (fp->off + fp->sz)) {
                         //offset is error, reset to last offset
-                        lseek(fp->fd, new_off, SEEK_SET);
+                        lseek(fp->fd, (off_t)fp->cur, SEEK_SET);
                         new_off = -1;
                     } else {
                         fp->cur = new_off;
